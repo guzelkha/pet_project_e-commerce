@@ -4,18 +4,26 @@ import duckdb
 import pendulum # для работы с datetime
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.python import PythonOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.models import variable
 
 # конфигурация DAG
 OWNER = "guzelkha"
-DAG_ID = "raw_from_api_to_s3"
+DAG_ID = "raw_from_s3_to_pg"
 
 # используемые таблицы в DAG
 LAYER = "raw" # слой данных
 SOURCE = "frankfurter"
+SCHEMA = "ods"
+TARGET_TABLE = "fct_frankfurter"
 
 # S3
 MINIO_ACCESS_KEY = "minioadmin" 
 MINIO_SECRET_KEY = "minioadmin" 
+
+#DUCKDB
+PASSWORD = "postgres"
+
 
 # настройки по умолчанию для DAG
 args = {
@@ -36,17 +44,13 @@ def get_dates(**context):
     end_date = context["data_interval_end"].format("YYYY-MM-DD")
     return start_date, end_date
 
-def get_and_transfer_api_data_to_s3(**context):
-    
-    """ 
-    Достает данные из Fake Store Api и сохраняет в S3 
-    """
-    
+def get_and_transfer_raw_data_to_ods_pg(**context):
+    """ """
     # получаем даты из context
     start_date, end_date = get_dates(**context)
     logging.info(f" Start load for dates {start_date}/{end_date}")
     
-    con = duckdb.connect()
+    con = duckdb.connect()   
     
     con.sql(
         f"""
@@ -58,24 +62,35 @@ def get_and_transfer_api_data_to_s3(**context):
         SET s3_secret_access_key = 'minioadmin';
         SET s3_use_ssl = FALSE;
         
-        COPY
-        (
-            SELECT * FROM
-            read_json_auto('https://api.frankfurter.dev/v1/{start_date}?base=USD&symbols=EUR,GBP')
-        )
-        TO
-        's3://prod/{LAYER}/{SOURCE}/{start_date}/{start_date}_00-00-00.gz.parquet';
-        """,
+        CREATE SECRET dw_postgres (
+            TYPE postgres,
+            HOST 'postgres_dwh'
+            PORT 5432,
+            DATABASE postgres,
+            USER 'postgres',
+            PASSWORD 'postgres',
+        );
+        
+        ATTACH '' AS dwh_postgres_db (TYPE postgres,
+            HOST 'postgres_dwh'
+            PORT 5432,
+            DATABASE postgres,
+            USER 'postgres',
+            PASSWORD 'postgres')
+            
+        INSERT INTO dwh_postgres_db.{SCHEMA}.{TARGET_TABLE}
+        SELECT * FROM 's3://prod/{LAYER}/{SOURCE}/{start_date}/{start_date}_00-00-00.gz.parquet';
+        """
     )
     
     con.close()
-    logging.info(f" Downloaded for date {start_date}/{end_date} success")
+    logging.info(f"Download for date {start_date} success")
     
 with DAG(
     dag_id=DAG_ID,
     default_args=args,
     schedule_interval="0 5 * * *", # 0 — минуты (0) 5 — часы (5 утра) * — любой день месяца * — любой месяц * — любой день недели
-    tags=["s3", "raw"], 
+    tags=["s3", "ods", "pg"], 
     # исключаем параллелизм, чтобы работать локально и не грузить докер:
     concurrency=1,
     max_active_tasks=1,
@@ -83,16 +98,26 @@ with DAG(
 ) as dag:
     #tasks
     start = EmptyOperator(
-        task_id="start"
+        task_id="start",
     )
     
-    get_and_transfer_api_data_to_s3 = PythonOperator(
+    sensor_on_raw_layer = ExternalTaskSensor(
+        task_id="sensor_on_raw_layer",
+        external_dag_id="raw_from_api_to_s3",
+        allowed_states=["success"],
+        mode="reschedule",
+        timeout=360000, #длительность работы сенсора
+        poke_interval=60, #частота проверки
+    )
+    
+    get_and_transfer_raw_data_to_ods_pg = PythonOperator(
         task_id="get_and_transfer_api_data_to_s3",
-        python_callable=get_and_transfer_api_data_to_s3
+        python_callable=get_and_transfer_raw_data_to_ods_pg
     )
     
     end = EmptyOperator(
         task_id="end"
     )
     
-    start >> get_and_transfer_api_data_to_s3 >> end
+    start >> sensor_on_raw_layer >> get_and_transfer_raw_data_to_ods_pg >> end
+    
